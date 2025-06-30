@@ -144,6 +144,8 @@ cursor.execute(
         created_at TEXT,
         card TEXT,
         admin_id INTEGER,
+        full_name TEXT,
+        phone TEXT,
         address TEXT,
         shipping_service TEXT,
         tracking_number TEXT
@@ -210,6 +212,8 @@ expected_order_cols = {
     "created_at": "TEXT",
     "card": "TEXT",
     "admin_id": "INTEGER",
+    "full_name": "TEXT",
+    "phone": "TEXT",
     "address": "TEXT",
     "shipping_service": "TEXT",
     "tracking_number": "TEXT",
@@ -726,7 +730,7 @@ def admin_orders(message):
     # reset state to avoid conflicts with other admin actions
     user_states.pop(message.chat.id, None)
     rows = cursor.execute(
-        "SELECT o.id, o.user_id, u.username, o.total, o.status, o.created_at, o.address, o.shipping_service, o.tracking_number "
+        "SELECT o.id, o.user_id, u.username, o.total, o.status, o.created_at, o.full_name, o.phone, o.address, o.shipping_service, o.tracking_number "
         "FROM orders o JOIN users u ON u.telegram_id=o.user_id "
         "ORDER BY o.id DESC LIMIT 10"
     ).fetchall()
@@ -737,10 +741,14 @@ def admin_orders(message):
     for r in rows:
         dt = datetime.fromisoformat(r[5]).strftime("%Y-%m-%d %H:%M")
         tag = f"@{r[2]}" if r[2] else str(r[1])
-        addr = f" | {r[6]}" if r[6] else ""
-        svc = f" | {r[7]}" if r[7] else ""
-        track = f" | {r[8]}" if r[8] else ""
-        texts.append(f"#{r[0]} | {tag} | {r[4]} | {r[3]} руб. | {dt}{addr}{svc}{track}")
+        name = f" | {r[6]}" if r[6] else ""
+        phone = f" | {r[7]}" if r[7] else ""
+        addr = f" | {r[8]}" if r[8] else ""
+        svc = f" | {r[9]}" if r[9] else ""
+        track = f" | {r[10]}" if r[10] else ""
+        texts.append(
+            f"#{r[0]} | {tag} | {r[4]} | {r[3]} руб. | {dt}{name}{phone}{addr}{svc}{track}"
+        )
     bot.send_message(message.chat.id, "\n".join(texts))
 
 
@@ -802,14 +810,17 @@ def admin_referrals(message):
 def admin_order_statuses(message):
     user_states.pop(message.chat.id, None)
     rows = cursor.execute(
-        "SELECT o.id, o.user_id, o.status, o.shipping_service, o.tracking_number, u.username FROM orders o JOIN users u ON u.telegram_id=o.user_id ORDER BY o.id DESC LIMIT 20"
+        "SELECT o.id, o.user_id, o.status, o.shipping_service, o.tracking_number, u.username, o.full_name, o.phone, o.address FROM orders o JOIN users u ON u.telegram_id=o.user_id ORDER BY o.id DESC LIMIT 20"
     ).fetchall()
     if not rows:
         bot.send_message(message.chat.id, "Заказов нет")
         return
-    for oid, uid, status, svc, track, username in rows:
+    for oid, uid, status, svc, track, username, name, phone, addr in rows:
         tag = f"@{username}" if username else str(uid)
-        text = f"#{oid} | {tag} | {status} | {svc or '-'} | {track or '-'}"
+        text = (
+            f"#{oid} | {tag} | {status} | {svc or '-'} | {track or '-'}"
+            f" | {name or '-'} | {phone or '-'} | {addr or '-'}"
+        )
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("Изменить", callback_data=f"ostatus_{oid}"))
         bot.send_message(message.chat.id, text, reply_markup=markup)
@@ -1247,7 +1258,7 @@ def handle_callbacks(call):
         st.pop("step", None)
         card = random.choice(PAYMENT_CARDS)
         order_id = cursor.execute(
-            "INSERT INTO orders(user_id, total, status, promo_code, created_at, card, admin_id, shipping_service) VALUES (?, ?, 'waiting', ?, ?, ?, ?, ?)",
+            "INSERT INTO orders(user_id, total, status, promo_code, created_at, card, admin_id, full_name, phone, address, shipping_service) VALUES (?, ?, 'waiting', ?, ?, ?, ?, '', '', '', ?)",
             (
                 call.from_user.id,
                 total,
@@ -1281,7 +1292,11 @@ def handle_callbacks(call):
         conn.commit()
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         bot.answer_callback_query(call.id, "Подтверждено")
-        bot.send_message(row[0], f"Ваш заказ #{order_id} подтвержден. Пожалуйста, отправьте адрес доставки")
+        bot.send_message(
+            row[0],
+            f"Ваш заказ #{order_id} подтвержден. "
+            "Отправьте ФИО, телефон и адрес пункта выдачи каждое с новой строки",
+        )
         user_states[row[0]] = {"awaiting_address": order_id}
     elif data.startswith("cancel_") and is_admin(call.from_user.id):
         order_id = int(data.split("_")[1])
@@ -1511,13 +1526,28 @@ def receive_address(message):
     order_id = st.get("awaiting_address") if st else None
     if not order_id:
         return
-    address = message.text.strip()
-    cursor.execute("UPDATE orders SET address=? WHERE id=?", (address, order_id))
+    parts = [p.strip() for p in message.text.split('\n') if p.strip()]
+    if len(parts) < 3:
+        bot.send_message(
+            message.chat.id,
+            "Отправьте данные в формате:\nФИО\nТелефон\nАдрес",
+        )
+        user_states[message.chat.id] = {"awaiting_address": order_id}
+        return
+    full_name, phone, *addr_parts = parts
+    address = " ".join(addr_parts)
+    cursor.execute(
+        "UPDATE orders SET full_name=?, phone=?, address=? WHERE id=?",
+        (full_name, phone, address, order_id),
+    )
     conn.commit()
-    bot.send_message(message.chat.id, "Адрес сохранен. Ожидайте отправки заказа")
+    bot.send_message(message.chat.id, "Данные сохранены. Ожидайте отправки заказа")
     admin_id = cursor.execute("SELECT admin_id FROM orders WHERE id=?", (order_id,)).fetchone()[0]
     tag = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
-    bot.send_message(admin_id, f"Пользователь {tag} ({message.from_user.id}) указал адрес по заказу #{order_id}:\n{address}")
+    bot.send_message(
+        admin_id,
+        f"Пользователь {tag} ({message.from_user.id}) указал данные по заказу #{order_id}:\nФИО: {full_name}\nТелефон: {phone}\nАдрес: {address}",
+    )
 
 
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "track_input")
@@ -1552,7 +1582,11 @@ def admin_confirm(message):
     conn.commit()
     logging.info("Admin %s confirmed order %s", message.from_user.id, order_id)
     bot.reply_to(message, "Заказ подтвержден")
-    bot.send_message(row[0], f"Ваш заказ #{order_id} подтвержден. Пожалуйста, отправьте адрес доставки")
+    bot.send_message(
+        row[0],
+        f"Ваш заказ #{order_id} подтвержден. "
+        "Отправьте ФИО, телефон и адрес пункта выдачи каждое с новой строки",
+    )
     user_states[row[0]] = {"awaiting_address": order_id}
 
 
