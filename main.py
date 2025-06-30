@@ -19,6 +19,7 @@ logging.basicConfig(
 TOKEN = "8148136479:AAG-Hz9XWqDN-H5hYMENE_NdfUSly1Rg35w"
 
 bot = telebot.TeleBot(TOKEN)
+BOT_USERNAME = bot.get_me().username
 
 # Admin IDs
 # Replace or extend this list with the Telegram IDs of people who
@@ -184,7 +185,9 @@ cursor.execute(
         username TEXT,
         first_name TEXT,
         last_name TEXT,
-        banned INTEGER DEFAULT 0
+        banned INTEGER DEFAULT 0,
+        referral_code TEXT,
+        referrer_id INTEGER
     )"""
 )
 
@@ -242,6 +245,12 @@ user_cols = {row[1] for row in cursor.execute("PRAGMA table_info(users)")}
 if "banned" not in user_cols:
     cursor.execute("ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0")
     conn.commit()
+if "referral_code" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN referral_code TEXT")
+    conn.commit()
+if "referrer_id" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER")
+    conn.commit()
 
 # User states for conversation flow
 user_states = {}
@@ -298,8 +307,8 @@ def clear_cart(user_id):
     conn.commit()
 
 
-def register_user(user):
-    """Add user to database if not already registered."""
+def register_user(user, ref_code=None):
+    """Add or update user information and handle referral code."""
     cursor.execute(
         "INSERT OR IGNORE INTO users(telegram_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
         (
@@ -309,6 +318,32 @@ def register_user(user):
             user.last_name,
         ),
     )
+    # keep user info up to date
+    cursor.execute(
+        "UPDATE users SET username=?, first_name=?, last_name=? WHERE telegram_id=?",
+        (user.username, user.first_name, user.last_name, user.id),
+    )
+    row = cursor.execute(
+        "SELECT referral_code, referrer_id FROM users WHERE telegram_id=?",
+        (user.id,),
+    ).fetchone()
+    code, referrer = row
+    if code is None:
+        code = f"ref{user.id}"
+        cursor.execute(
+            "UPDATE users SET referral_code=? WHERE telegram_id=?",
+            (code, user.id),
+        )
+    if ref_code and referrer is None:
+        ref_row = cursor.execute(
+            "SELECT telegram_id FROM users WHERE referral_code=?",
+            (ref_code,),
+        ).fetchone()
+        if ref_row and ref_row[0] != user.id:
+            cursor.execute(
+                "UPDATE users SET referrer_id=? WHERE telegram_id=?",
+                (ref_row[0], user.id),
+            )
     conn.commit()
 
 
@@ -443,6 +478,7 @@ def send_main_menu(chat_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("🛍 Каталог", "🛒 Корзина")
     markup.add("📜 Мои заказы", "💬 Поддержка")
+    markup.add("🎁 Рефералы")
     if is_admin(chat_id):
         markup.add("⚙️ Админ панель")
     bot.send_message(chat_id, "Добро пожаловать в магазин одежды Friendly Wears!", reply_markup=markup)
@@ -496,7 +532,11 @@ def handle_start(message):
     if is_banned(message.from_user.id):
         bot.send_message(message.chat.id, "Вы заблокированы")
         return
-    register_user(message.from_user)
+    parts = message.text.split(maxsplit=1)
+    ref_code = None
+    if len(parts) > 1:
+        ref_code = parts[1]
+    register_user(message.from_user, ref_code)
     send_main_menu(message.chat.id)
 
 
@@ -579,6 +619,35 @@ def handle_support(message):
     user_states[message.chat.id] = {"step": "support_menu"}
     bot.send_message(message.chat.id, "Выберите действие", reply_markup=markup)
 
+
+@bot.message_handler(func=lambda m: m.text == "🎁 Рефералы")
+def handle_referrals(message):
+    row = cursor.execute(
+        "SELECT referral_code FROM users WHERE telegram_id=?",
+        (message.from_user.id,),
+    ).fetchone()
+    code = row[0] if row else f"ref{message.from_user.id}"
+    # ensure code exists
+    cursor.execute(
+        "UPDATE users SET referral_code=? WHERE telegram_id=?",
+        (code, message.from_user.id),
+    )
+    conn.commit()
+    count = cursor.execute(
+        "SELECT COUNT(*) FROM users WHERE referrer_id=?",
+        (message.from_user.id,),
+    ).fetchone()[0]
+    discount = count * 5
+    link = f"https://t.me/{BOT_USERNAME}?start={code}"
+    text = (
+        f"Ваша реферальная ссылка:\n{link}\n"
+        f"Приглашено: {count}\n"
+        f"Ваша скидка: {discount}%"
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Получить скидку", callback_data="get_discount"))
+    bot.send_message(message.chat.id, text, reply_markup=markup)
+
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "support_menu" and m.text == "📝 Написать тикет")
 def support_new_ticket_prompt(message):
     st = user_states[message.chat.id]
@@ -619,7 +688,7 @@ def handle_admin_panel(message):
     markup.add("➕ Добавить товар", "🎟 Промокоды")
     markup.add("📝 Товары", "📦 Заказы")
     markup.add("📊 Статистика", "📢 Рассылка")
-    markup.add("🎫 Тикеты")
+    markup.add("🎫 Тикеты", "👥 Рефералы")
     markup.add("🔙 В меню")
     bot.send_message(message.chat.id, "Меню администратора", reply_markup=markup)
 
@@ -701,6 +770,24 @@ def admin_tickets(message):
             types.InlineKeyboardButton("Закрыть", callback_data=f"tclose_{tid}")
         )
         bot.send_message(message.chat.id, text, reply_markup=markup)
+
+
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "👥 Рефералы")
+def admin_referrals(message):
+    rows = cursor.execute(
+        "SELECT telegram_id, username, referral_code FROM users"
+    ).fetchall()
+    lines = []
+    for uid, username, code in rows:
+        link = f"https://t.me/{BOT_USERNAME}?start={code if code else 'ref'+str(uid)}"
+        count = cursor.execute(
+            "SELECT COUNT(*) FROM users WHERE referrer_id=?",
+            (uid,),
+        ).fetchone()[0]
+        discount = count * 5
+        tag = f"@{username}" if username else str(uid)
+        lines.append(f"{tag} | {link} | {count} реф. | скидка {discount}%")
+    bot.send_message(message.chat.id, "\n".join(lines) if lines else "Нет пользователей")
 
 
 @bot.message_handler(commands=["tickets"], func=lambda m: is_admin(m.from_user.id))
@@ -1067,6 +1154,34 @@ def handle_callbacks(call):
         st = user_states.setdefault(call.message.chat.id, {})
         st["step"] = "enter_promo"
         bot.send_message(call.message.chat.id, "Введите промокод")
+    elif data == "get_discount":
+        count = cursor.execute(
+            "SELECT COUNT(*) FROM users WHERE referrer_id=?",
+            (call.from_user.id,),
+        ).fetchone()[0]
+        if count == 0:
+            bot.answer_callback_query(call.id, "У вас нет рефералов")
+            return
+        discount = count * 5
+        while True:
+            code = f"REF{random.randint(100000,999999)}"
+            exists = cursor.execute(
+                "SELECT 1 FROM promo_codes WHERE code=?",
+                (code,),
+            ).fetchone()
+            if not exists:
+                break
+        exp = datetime.now() + timedelta(days=30)
+        cursor.execute(
+            "INSERT OR REPLACE INTO promo_codes(code, percent, usage_limit, expires_at) VALUES (?, ?, ?, ?)",
+            (code, discount, 1, exp.isoformat()),
+        )
+        conn.commit()
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            f"Ваш промокод: {code}\nСкидка {discount}%\nДействует 30 дней, 1 использование",
+        )
     elif data == "pay":
         total = get_cart_total(call.from_user.id)
         if total == 0:
