@@ -1,3 +1,13 @@
+"""Telegram shop bot.
+
+Setup:
+    pip install pyTelegramBotAPI
+    python main.py
+
+Replace TOKEN with your bot token before running. The bot stores data in
+``shop.db`` in the current directory.
+"""
+
 import os
 import random
 import sqlite3
@@ -19,6 +29,8 @@ logging.basicConfig(
 TOKEN = "8148136479:AAG-Hz9XWqDN-H5hYMENE_NdfUSly1Rg35w"
 
 bot = telebot.TeleBot(TOKEN)
+BOT_USERNAME = bot.get_me().username
+REFERRAL_DISCOUNT = 5  # percent per invited user
 
 # Admin IDs
 # Replace or extend this list with the Telegram IDs of people who
@@ -142,7 +154,11 @@ cursor.execute(
         created_at TEXT,
         card TEXT,
         admin_id INTEGER,
-        address TEXT
+        full_name TEXT,
+        phone TEXT,
+        address TEXT,
+        shipping_service TEXT,
+        tracking_number TEXT
     )"""
 )
 
@@ -184,7 +200,9 @@ cursor.execute(
         username TEXT,
         first_name TEXT,
         last_name TEXT,
-        banned INTEGER DEFAULT 0
+        banned INTEGER DEFAULT 0,
+        referral_code TEXT,
+        referrer_id INTEGER
     )"""
 )
 
@@ -204,7 +222,11 @@ expected_order_cols = {
     "created_at": "TEXT",
     "card": "TEXT",
     "admin_id": "INTEGER",
+    "full_name": "TEXT",
+    "phone": "TEXT",
     "address": "TEXT",
+    "shipping_service": "TEXT",
+    "tracking_number": "TEXT",
 }
 
 existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(orders)")}
@@ -241,6 +263,12 @@ if "size" not in oi_cols:
 user_cols = {row[1] for row in cursor.execute("PRAGMA table_info(users)")}
 if "banned" not in user_cols:
     cursor.execute("ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0")
+    conn.commit()
+if "referral_code" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN referral_code TEXT")
+    conn.commit()
+if "referrer_id" not in user_cols:
+    cursor.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER")
     conn.commit()
 
 # User states for conversation flow
@@ -298,8 +326,8 @@ def clear_cart(user_id):
     conn.commit()
 
 
-def register_user(user):
-    """Add user to database if not already registered."""
+def register_user(user, ref_code=None):
+    """Add or update user information and handle referral code."""
     cursor.execute(
         "INSERT OR IGNORE INTO users(telegram_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
         (
@@ -309,6 +337,32 @@ def register_user(user):
             user.last_name,
         ),
     )
+    # keep user info up to date
+    cursor.execute(
+        "UPDATE users SET username=?, first_name=?, last_name=? WHERE telegram_id=?",
+        (user.username, user.first_name, user.last_name, user.id),
+    )
+    row = cursor.execute(
+        "SELECT referral_code, referrer_id FROM users WHERE telegram_id=?",
+        (user.id,),
+    ).fetchone()
+    code, referrer = row
+    if code is None:
+        code = f"ref{user.id}"
+        cursor.execute(
+            "UPDATE users SET referral_code=? WHERE telegram_id=?",
+            (code, user.id),
+        )
+    if ref_code and referrer is None:
+        ref_row = cursor.execute(
+            "SELECT telegram_id FROM users WHERE referral_code=?",
+            (ref_code,),
+        ).fetchone()
+        if ref_row and ref_row[0] != user.id:
+            cursor.execute(
+                "UPDATE users SET referrer_id=? WHERE telegram_id=?",
+                (ref_row[0], user.id),
+            )
     conn.commit()
 
 
@@ -443,6 +497,7 @@ def send_main_menu(chat_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("🛍 Каталог", "🛒 Корзина")
     markup.add("📜 Мои заказы", "💬 Поддержка")
+    markup.add("🎁 Рефералы")
     if is_admin(chat_id):
         markup.add("⚙️ Админ панель")
     bot.send_message(chat_id, "Добро пожаловать в магазин одежды Friendly Wears!", reply_markup=markup)
@@ -496,7 +551,11 @@ def handle_start(message):
     if is_banned(message.from_user.id):
         bot.send_message(message.chat.id, "Вы заблокированы")
         return
-    register_user(message.from_user)
+    parts = message.text.split(maxsplit=1)
+    ref_code = None
+    if len(parts) > 1:
+        ref_code = parts[1]
+    register_user(message.from_user, ref_code)
     send_main_menu(message.chat.id)
 
 
@@ -579,6 +638,35 @@ def handle_support(message):
     user_states[message.chat.id] = {"step": "support_menu"}
     bot.send_message(message.chat.id, "Выберите действие", reply_markup=markup)
 
+
+@bot.message_handler(func=lambda m: m.text == "🎁 Рефералы")
+def handle_referrals(message):
+    row = cursor.execute(
+        "SELECT referral_code FROM users WHERE telegram_id=?",
+        (message.from_user.id,),
+    ).fetchone()
+    code = row[0] if row else f"ref{message.from_user.id}"
+    # ensure code exists
+    cursor.execute(
+        "UPDATE users SET referral_code=? WHERE telegram_id=?",
+        (code, message.from_user.id),
+    )
+    conn.commit()
+    count = cursor.execute(
+        "SELECT COUNT(*) FROM users WHERE referrer_id=?",
+        (message.from_user.id,),
+    ).fetchone()[0]
+    discount = count * REFERRAL_DISCOUNT
+    link = f"https://t.me/{BOT_USERNAME}?start={code}"
+    text = (
+        f"Ваша реферальная ссылка:\n{link}\n"
+        f"Приглашено: {count}\n"
+        f"Ваша скидка: {discount}%"
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Получить скидку", callback_data="get_discount"))
+    bot.send_message(message.chat.id, text, reply_markup=markup)
+
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "support_menu" and m.text == "📝 Написать тикет")
 def support_new_ticket_prompt(message):
     st = user_states[message.chat.id]
@@ -619,7 +707,8 @@ def handle_admin_panel(message):
     markup.add("➕ Добавить товар", "🎟 Промокоды")
     markup.add("📝 Товары", "📦 Заказы")
     markup.add("📊 Статистика", "📢 Рассылка")
-    markup.add("🎫 Тикеты")
+    markup.add("🎫 Тикеты", "👥 Рефералы")
+    markup.add("🚚 Статус заказов")
     markup.add("🔙 В меню")
     bot.send_message(message.chat.id, "Меню администратора", reply_markup=markup)
 
@@ -651,7 +740,7 @@ def admin_orders(message):
     # reset state to avoid conflicts with other admin actions
     user_states.pop(message.chat.id, None)
     rows = cursor.execute(
-        "SELECT o.id, o.user_id, u.username, o.total, o.status, o.created_at, o.address "
+        "SELECT o.id, o.user_id, u.username, o.total, o.status, o.created_at, o.full_name, o.phone, o.address, o.shipping_service, o.tracking_number "
         "FROM orders o JOIN users u ON u.telegram_id=o.user_id "
         "ORDER BY o.id DESC LIMIT 10"
     ).fetchall()
@@ -662,8 +751,14 @@ def admin_orders(message):
     for r in rows:
         dt = datetime.fromisoformat(r[5]).strftime("%Y-%m-%d %H:%M")
         tag = f"@{r[2]}" if r[2] else str(r[1])
-        addr = f" | {r[6]}" if r[6] else ""
-        texts.append(f"#{r[0]} | {tag} | {r[4]} | {r[3]} руб. | {dt}{addr}")
+        name = f" | {r[6]}" if r[6] else ""
+        phone = f" | {r[7]}" if r[7] else ""
+        addr = f" | {r[8]}" if r[8] else ""
+        svc = f" | {r[9]}" if r[9] else ""
+        track = f" | {r[10]}" if r[10] else ""
+        texts.append(
+            f"#{r[0]} | {tag} | {r[4]} | {r[3]} руб. | {dt}{name}{phone}{addr}{svc}{track}"
+        )
     bot.send_message(message.chat.id, "\n".join(texts))
 
 
@@ -700,6 +795,44 @@ def admin_tickets(message):
             types.InlineKeyboardButton("Ответить", callback_data=f"topen_{tid}"),
             types.InlineKeyboardButton("Закрыть", callback_data=f"tclose_{tid}")
         )
+        bot.send_message(message.chat.id, text, reply_markup=markup)
+
+
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "👥 Рефералы")
+def admin_referrals(message):
+    rows = cursor.execute(
+        "SELECT telegram_id, username, referral_code FROM users"
+    ).fetchall()
+    lines = []
+    for uid, username, code in rows:
+        link = f"https://t.me/{BOT_USERNAME}?start={code if code else 'ref'+str(uid)}"
+        count = cursor.execute(
+            "SELECT COUNT(*) FROM users WHERE referrer_id=?",
+            (uid,),
+        ).fetchone()[0]
+        discount = count * REFERRAL_DISCOUNT
+        tag = f"@{username}" if username else str(uid)
+        lines.append(f"{tag} | {link} | {count} реф. | скидка {discount}%")
+    bot.send_message(message.chat.id, "\n".join(lines) if lines else "Нет пользователей")
+
+
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "🚚 Статус заказов")
+def admin_order_statuses(message):
+    user_states.pop(message.chat.id, None)
+    rows = cursor.execute(
+        "SELECT o.id, o.user_id, o.status, o.shipping_service, o.tracking_number, u.username, o.full_name, o.phone, o.address FROM orders o JOIN users u ON u.telegram_id=o.user_id ORDER BY o.id DESC LIMIT 20"
+    ).fetchall()
+    if not rows:
+        bot.send_message(message.chat.id, "Заказов нет")
+        return
+    for oid, uid, status, svc, track, username, name, phone, addr in rows:
+        tag = f"@{username}" if username else str(uid)
+        text = (
+            f"#{oid} | {tag} | {status} | {svc or '-'} | {track or '-'}"
+            f" | {name or '-'} | {phone or '-'} | {addr or '-'}"
+        )
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("Изменить", callback_data=f"ostatus_{oid}"))
         bot.send_message(message.chat.id, text, reply_markup=markup)
 
 
@@ -783,11 +916,11 @@ def send_statistics(chat_id):
     users_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     orders_count = cursor.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     revenue = (
-        cursor.execute("SELECT SUM(total) FROM orders WHERE status='confirmed'").fetchone()[0]
+        cursor.execute("SELECT SUM(total) FROM orders WHERE status!='canceled'").fetchone()[0]
         or 0
     )
     rows = cursor.execute(
-        "SELECT id, user_id, total, created_at FROM orders WHERE status='confirmed' ORDER BY id DESC LIMIT 10"
+        "SELECT id, user_id, total, created_at FROM orders WHERE status!='canceled' ORDER BY id DESC LIMIT 10"
     ).fetchall()
     lines = []
     for oid, uid, total, dt in rows:
@@ -1021,7 +1154,6 @@ def handle_callbacks(call):
             update_cart_item(call.from_user.id, prod_id, "", qty)
             bot.answer_callback_query(call.id, "Добавлено в корзину")
             bot.delete_message(call.message.chat.id, call.message.message_id)
-            show_cart(call.message.chat.id, call.from_user.id)
     elif data.startswith("addsz_"):
         _, pid, size = data.split("_", 2)
         pid = int(pid)
@@ -1033,7 +1165,6 @@ def handle_callbacks(call):
         update_cart_item(call.from_user.id, pid, size, qty)
         bot.answer_callback_query(call.id, "Добавлено в корзину")
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        show_cart(call.message.chat.id, call.from_user.id)
     elif data.startswith("inc_"):
         parts = data.split("_")
         prod_id = int(parts[1])
@@ -1067,6 +1198,34 @@ def handle_callbacks(call):
         st = user_states.setdefault(call.message.chat.id, {})
         st["step"] = "enter_promo"
         bot.send_message(call.message.chat.id, "Введите промокод")
+    elif data == "get_discount":
+        count = cursor.execute(
+            "SELECT COUNT(*) FROM users WHERE referrer_id=?",
+            (call.from_user.id,),
+        ).fetchone()[0]
+        if count == 0:
+            bot.answer_callback_query(call.id, "У вас нет рефералов")
+            return
+        discount = count * REFERRAL_DISCOUNT
+        while True:
+            code = f"REF{random.randint(100000,999999)}"
+            exists = cursor.execute(
+                "SELECT 1 FROM promo_codes WHERE code=?",
+                (code,),
+            ).fetchone()
+            if not exists:
+                break
+        exp = datetime.now() + timedelta(days=30)
+        cursor.execute(
+            "INSERT OR REPLACE INTO promo_codes(code, percent, usage_limit, expires_at) VALUES (?, ?, ?, ?)",
+            (code, discount, 1, exp.isoformat()),
+        )
+        conn.commit()
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            f"Ваш промокод: {code}\nСкидка {discount}%\nДействует 30 дней, 1 использование",
+        )
     elif data == "pay":
         total = get_cart_total(call.from_user.id)
         if total == 0:
@@ -1074,16 +1233,40 @@ def handle_callbacks(call):
             return
         st = user_states.setdefault(call.message.chat.id, {})
         promo = st.get("promo")
-        # re-check promo validity in case usage changed since entry
         total, discount = apply_promo(total, promo)
         if promo and discount == 0:
             bot.answer_callback_query(call.id, "Промокод недействителен")
             st.pop("promo", None)
             show_cart(call.message.chat.id, call.from_user.id)
             return
+        st["pending_total"] = total
+        st["pending_promo"] = promo
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("Боксберри", callback_data="svc_boxberry"),
+            types.InlineKeyboardButton("СДЭК", callback_data="svc_sdek"),
+            types.InlineKeyboardButton("Почта РФ", callback_data="svc_post"),
+        )
+        bot.send_message(call.message.chat.id, "Выберите службу доставки", reply_markup=markup)
+        st["step"] = "choose_service"
+        bot.answer_callback_query(call.id)
+    elif data.startswith("svc_"):
+        st = user_states.get(call.message.chat.id, {})
+        if st.get("step") != "choose_service":
+            bot.answer_callback_query(call.id)
+            return
+        service_map = {
+            "svc_boxberry": "Боксберри",
+            "svc_sdek": "СДЭК",
+            "svc_post": "Почта РФ",
+        }
+        service = service_map.get(data)
+        total = st.pop("pending_total", 0)
+        promo = st.pop("pending_promo", None)
+        st.pop("step", None)
         card = random.choice(PAYMENT_CARDS)
         order_id = cursor.execute(
-            "INSERT INTO orders(user_id, total, status, promo_code, created_at, card, admin_id) VALUES (?, ?, 'waiting', ?, ?, ?, ?)",
+            "INSERT INTO orders(user_id, total, status, promo_code, created_at, card, admin_id, full_name, phone, address, shipping_service) VALUES (?, ?, 'waiting', ?, ?, ?, ?, '', '', '', ?)",
             (
                 call.from_user.id,
                 total,
@@ -1091,6 +1274,7 @@ def handle_callbacks(call):
                 datetime.now().isoformat(),
                 card["card"],
                 card["admin_id"],
+                service,
             ),
         ).lastrowid
         items = cursor.execute("SELECT product_id, size, quantity FROM carts WHERE user_id=?", (call.from_user.id,)).fetchall()
@@ -1101,7 +1285,7 @@ def handle_callbacks(call):
                 (order_id, prod_id, size, qty, price),
             )
         conn.commit()
-        if promo and discount > 0:
+        if promo:
             increment_promo_use(promo)
         st["awaiting_proof"] = order_id
         logging.info("Order %s created by %s for %s rub", order_id, call.from_user.id, total)
@@ -1112,11 +1296,15 @@ def handle_callbacks(call):
         if not row:
             bot.answer_callback_query(call.id, "Заказ не найден")
             return
-        cursor.execute("UPDATE orders SET status='confirmed' WHERE id=?", (order_id,))
+        cursor.execute("UPDATE orders SET status='created' WHERE id=?", (order_id,))
         conn.commit()
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         bot.answer_callback_query(call.id, "Подтверждено")
-        bot.send_message(row[0], f"Ваш заказ #{order_id} подтвержден. Пожалуйста, отправьте адрес доставки")
+        bot.send_message(
+            row[0],
+            f"Ваш заказ #{order_id} подтвержден. "
+            "Отправьте ФИО, телефон и адрес пункта выдачи каждое с новой строки",
+        )
         user_states[row[0]] = {"awaiting_address": order_id}
     elif data.startswith("cancel_") and is_admin(call.from_user.id):
         order_id = int(data.split("_")[1])
@@ -1135,6 +1323,18 @@ def handle_callbacks(call):
         conn.commit()
         bot.edit_message_text("Товар удален", call.message.chat.id, call.message.message_id)
         bot.answer_callback_query(call.id, "Удалено")
+    elif data.startswith("ostatus_") and is_admin(call.from_user.id):
+        oid = int(data.split("_")[1])
+        user_states[call.message.chat.id] = {"step": "edit_order_status", "order_id": oid}
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("Создан", callback_data="status_created"),
+            types.InlineKeyboardButton("Отправлен", callback_data="status_shipped"),
+            types.InlineKeyboardButton("Получен", callback_data="status_received"),
+        )
+        markup.add(types.InlineKeyboardButton("Трек-номер", callback_data="enter_track"))
+        bot.send_message(call.message.chat.id, "Выберите новый статус или введите трек", reply_markup=markup)
+        bot.answer_callback_query(call.id)
     elif data.startswith("uopen_"):
         tid = int(data.split("_")[1])
         row = cursor.execute(
@@ -1223,6 +1423,33 @@ def handle_callbacks(call):
                 bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
                 bot.answer_callback_query(call.id, "Тикет закрыт")
                 bot.send_message(user_id, f"Ваш тикет #{tid} закрыт администратором")
+    elif data.startswith("status_") and is_admin(call.from_user.id):
+        st = user_states.get(call.message.chat.id, {})
+        oid = st.get("order_id")
+        if not oid:
+            bot.answer_callback_query(call.id)
+            return
+        status_map = {
+            "status_created": "created",
+            "status_shipped": "shipped",
+            "status_received": "received",
+        }
+        new_status = status_map.get(data)
+        if new_status:
+            cursor.execute("UPDATE orders SET status=? WHERE id=?", (new_status, oid))
+            conn.commit()
+            bot.send_message(call.message.chat.id, "Статус обновлен")
+        user_states.pop(call.message.chat.id, None)
+        bot.answer_callback_query(call.id)
+    elif data == "enter_track" and is_admin(call.from_user.id):
+        st = user_states.get(call.message.chat.id, {})
+        oid = st.get("order_id")
+        if not oid:
+            bot.answer_callback_query(call.id)
+            return
+        st["step"] = "track_input"
+        bot.send_message(call.message.chat.id, "Введите трек-номер")
+        bot.answer_callback_query(call.id)
     else:
         bot.answer_callback_query(call.id)
 
@@ -1307,13 +1534,40 @@ def receive_address(message):
     order_id = st.get("awaiting_address") if st else None
     if not order_id:
         return
-    address = message.text.strip()
-    cursor.execute("UPDATE orders SET address=? WHERE id=?", (address, order_id))
+    parts = [p.strip() for p in message.text.split('\n') if p.strip()]
+    if len(parts) < 3:
+        bot.send_message(
+            message.chat.id,
+            "Отправьте данные в формате:\nФИО\nТелефон\nАдрес",
+        )
+        user_states[message.chat.id] = {"awaiting_address": order_id}
+        return
+    full_name, phone, *addr_parts = parts
+    address = " ".join(addr_parts)
+    cursor.execute(
+        "UPDATE orders SET full_name=?, phone=?, address=? WHERE id=?",
+        (full_name, phone, address, order_id),
+    )
     conn.commit()
-    bot.send_message(message.chat.id, "Адрес сохранен. Ожидайте отправки заказа")
+    bot.send_message(message.chat.id, "Данные сохранены. Ожидайте отправки заказа")
     admin_id = cursor.execute("SELECT admin_id FROM orders WHERE id=?", (order_id,)).fetchone()[0]
     tag = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
-    bot.send_message(admin_id, f"Пользователь {tag} ({message.from_user.id}) указал адрес по заказу #{order_id}:\n{address}")
+    bot.send_message(
+        admin_id,
+        f"Пользователь {tag} ({message.from_user.id}) указал данные по заказу #{order_id}:\nФИО: {full_name}\nТелефон: {phone}\nАдрес: {address}",
+    )
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "track_input")
+def admin_track_number(message):
+    st = user_states.pop(message.chat.id, None)
+    oid = st.get("order_id") if st else None
+    if not oid:
+        return
+    track = message.text.strip()
+    cursor.execute("UPDATE orders SET tracking_number=? WHERE id=?", (track, oid))
+    conn.commit()
+    bot.send_message(message.chat.id, "Трек-номер сохранен")
 
 
 @bot.message_handler(commands=["confirm"], func=lambda m: is_admin(m.from_user.id))
@@ -1332,11 +1586,15 @@ def admin_confirm(message):
     if not row:
         bot.reply_to(message, "Заказ не найден или не ваш")
         return
-    cursor.execute("UPDATE orders SET status='confirmed' WHERE id=?", (order_id,))
+    cursor.execute("UPDATE orders SET status='created' WHERE id=?", (order_id,))
     conn.commit()
     logging.info("Admin %s confirmed order %s", message.from_user.id, order_id)
     bot.reply_to(message, "Заказ подтвержден")
-    bot.send_message(row[0], f"Ваш заказ #{order_id} подтвержден. Пожалуйста, отправьте адрес доставки")
+    bot.send_message(
+        row[0],
+        f"Ваш заказ #{order_id} подтвержден. "
+        "Отправьте ФИО, телефон и адрес пункта выдачи каждое с новой строки",
+    )
     user_states[row[0]] = {"awaiting_address": order_id}
 
 
