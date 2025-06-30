@@ -1,3 +1,13 @@
+"""Telegram shop bot.
+
+Setup:
+    pip install pyTelegramBotAPI
+    python main.py
+
+Replace TOKEN with your bot token before running. The bot stores data in
+``shop.db`` in the current directory.
+"""
+
 import os
 import random
 import sqlite3
