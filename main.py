@@ -144,7 +144,9 @@ cursor.execute(
         created_at TEXT,
         card TEXT,
         admin_id INTEGER,
-        address TEXT
+        address TEXT,
+        shipping_service TEXT,
+        tracking_number TEXT
     )"""
 )
 
@@ -209,6 +211,8 @@ expected_order_cols = {
     "card": "TEXT",
     "admin_id": "INTEGER",
     "address": "TEXT",
+    "shipping_service": "TEXT",
+    "tracking_number": "TEXT",
 }
 
 existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(orders)")}
@@ -690,6 +694,7 @@ def handle_admin_panel(message):
     markup.add("📝 Товары", "📦 Заказы")
     markup.add("📊 Статистика", "📢 Рассылка")
     markup.add("🎫 Тикеты", "👥 Рефералы")
+    markup.add("🚚 Статус заказов")
     markup.add("🔙 В меню")
     bot.send_message(message.chat.id, "Меню администратора", reply_markup=markup)
 
@@ -721,7 +726,7 @@ def admin_orders(message):
     # reset state to avoid conflicts with other admin actions
     user_states.pop(message.chat.id, None)
     rows = cursor.execute(
-        "SELECT o.id, o.user_id, u.username, o.total, o.status, o.created_at, o.address "
+        "SELECT o.id, o.user_id, u.username, o.total, o.status, o.created_at, o.address, o.shipping_service, o.tracking_number "
         "FROM orders o JOIN users u ON u.telegram_id=o.user_id "
         "ORDER BY o.id DESC LIMIT 10"
     ).fetchall()
@@ -733,7 +738,9 @@ def admin_orders(message):
         dt = datetime.fromisoformat(r[5]).strftime("%Y-%m-%d %H:%M")
         tag = f"@{r[2]}" if r[2] else str(r[1])
         addr = f" | {r[6]}" if r[6] else ""
-        texts.append(f"#{r[0]} | {tag} | {r[4]} | {r[3]} руб. | {dt}{addr}")
+        svc = f" | {r[7]}" if r[7] else ""
+        track = f" | {r[8]}" if r[8] else ""
+        texts.append(f"#{r[0]} | {tag} | {r[4]} | {r[3]} руб. | {dt}{addr}{svc}{track}")
     bot.send_message(message.chat.id, "\n".join(texts))
 
 
@@ -789,6 +796,23 @@ def admin_referrals(message):
         tag = f"@{username}" if username else str(uid)
         lines.append(f"{tag} | {link} | {count} реф. | скидка {discount}%")
     bot.send_message(message.chat.id, "\n".join(lines) if lines else "Нет пользователей")
+
+
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "🚚 Статус заказов")
+def admin_order_statuses(message):
+    user_states.pop(message.chat.id, None)
+    rows = cursor.execute(
+        "SELECT o.id, o.user_id, o.status, o.shipping_service, o.tracking_number, u.username FROM orders o JOIN users u ON u.telegram_id=o.user_id ORDER BY o.id DESC LIMIT 20"
+    ).fetchall()
+    if not rows:
+        bot.send_message(message.chat.id, "Заказов нет")
+        return
+    for oid, uid, status, svc, track, username in rows:
+        tag = f"@{username}" if username else str(uid)
+        text = f"#{oid} | {tag} | {status} | {svc or '-'} | {track or '-'}"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("Изменить", callback_data=f"ostatus_{oid}"))
+        bot.send_message(message.chat.id, text, reply_markup=markup)
 
 
 @bot.message_handler(commands=["tickets"], func=lambda m: is_admin(m.from_user.id))
@@ -871,11 +895,11 @@ def send_statistics(chat_id):
     users_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     orders_count = cursor.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     revenue = (
-        cursor.execute("SELECT SUM(total) FROM orders WHERE status='confirmed'").fetchone()[0]
+        cursor.execute("SELECT SUM(total) FROM orders WHERE status!='canceled'").fetchone()[0]
         or 0
     )
     rows = cursor.execute(
-        "SELECT id, user_id, total, created_at FROM orders WHERE status='confirmed' ORDER BY id DESC LIMIT 10"
+        "SELECT id, user_id, total, created_at FROM orders WHERE status!='canceled' ORDER BY id DESC LIMIT 10"
     ).fetchall()
     lines = []
     for oid, uid, total, dt in rows:
@@ -1190,16 +1214,40 @@ def handle_callbacks(call):
             return
         st = user_states.setdefault(call.message.chat.id, {})
         promo = st.get("promo")
-        # re-check promo validity in case usage changed since entry
         total, discount = apply_promo(total, promo)
         if promo and discount == 0:
             bot.answer_callback_query(call.id, "Промокод недействителен")
             st.pop("promo", None)
             show_cart(call.message.chat.id, call.from_user.id)
             return
+        st["pending_total"] = total
+        st["pending_promo"] = promo
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("Боксберри", callback_data="svc_boxberry"),
+            types.InlineKeyboardButton("СДЭК", callback_data="svc_sdek"),
+            types.InlineKeyboardButton("Почта РФ", callback_data="svc_post"),
+        )
+        bot.send_message(call.message.chat.id, "Выберите службу доставки", reply_markup=markup)
+        st["step"] = "choose_service"
+        bot.answer_callback_query(call.id)
+    elif data.startswith("svc_"):
+        st = user_states.get(call.message.chat.id, {})
+        if st.get("step") != "choose_service":
+            bot.answer_callback_query(call.id)
+            return
+        service_map = {
+            "svc_boxberry": "Боксберри",
+            "svc_sdek": "СДЭК",
+            "svc_post": "Почта РФ",
+        }
+        service = service_map.get(data)
+        total = st.pop("pending_total", 0)
+        promo = st.pop("pending_promo", None)
+        st.pop("step", None)
         card = random.choice(PAYMENT_CARDS)
         order_id = cursor.execute(
-            "INSERT INTO orders(user_id, total, status, promo_code, created_at, card, admin_id) VALUES (?, ?, 'waiting', ?, ?, ?, ?)",
+            "INSERT INTO orders(user_id, total, status, promo_code, created_at, card, admin_id, shipping_service) VALUES (?, ?, 'waiting', ?, ?, ?, ?, ?)",
             (
                 call.from_user.id,
                 total,
@@ -1207,6 +1255,7 @@ def handle_callbacks(call):
                 datetime.now().isoformat(),
                 card["card"],
                 card["admin_id"],
+                service,
             ),
         ).lastrowid
         items = cursor.execute("SELECT product_id, size, quantity FROM carts WHERE user_id=?", (call.from_user.id,)).fetchall()
@@ -1217,7 +1266,7 @@ def handle_callbacks(call):
                 (order_id, prod_id, size, qty, price),
             )
         conn.commit()
-        if promo and discount > 0:
+        if promo:
             increment_promo_use(promo)
         st["awaiting_proof"] = order_id
         logging.info("Order %s created by %s for %s rub", order_id, call.from_user.id, total)
@@ -1228,7 +1277,7 @@ def handle_callbacks(call):
         if not row:
             bot.answer_callback_query(call.id, "Заказ не найден")
             return
-        cursor.execute("UPDATE orders SET status='confirmed' WHERE id=?", (order_id,))
+        cursor.execute("UPDATE orders SET status='created' WHERE id=?", (order_id,))
         conn.commit()
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         bot.answer_callback_query(call.id, "Подтверждено")
@@ -1251,6 +1300,18 @@ def handle_callbacks(call):
         conn.commit()
         bot.edit_message_text("Товар удален", call.message.chat.id, call.message.message_id)
         bot.answer_callback_query(call.id, "Удалено")
+    elif data.startswith("ostatus_") and is_admin(call.from_user.id):
+        oid = int(data.split("_")[1])
+        user_states[call.message.chat.id] = {"step": "edit_order_status", "order_id": oid}
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("Создан", callback_data="status_created"),
+            types.InlineKeyboardButton("Отправлен", callback_data="status_shipped"),
+            types.InlineKeyboardButton("Получен", callback_data="status_received"),
+        )
+        markup.add(types.InlineKeyboardButton("Трек-номер", callback_data="enter_track"))
+        bot.send_message(call.message.chat.id, "Выберите новый статус или введите трек", reply_markup=markup)
+        bot.answer_callback_query(call.id)
     elif data.startswith("uopen_"):
         tid = int(data.split("_")[1])
         row = cursor.execute(
@@ -1339,6 +1400,33 @@ def handle_callbacks(call):
                 bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
                 bot.answer_callback_query(call.id, "Тикет закрыт")
                 bot.send_message(user_id, f"Ваш тикет #{tid} закрыт администратором")
+    elif data.startswith("status_") and is_admin(call.from_user.id):
+        st = user_states.get(call.message.chat.id, {})
+        oid = st.get("order_id")
+        if not oid:
+            bot.answer_callback_query(call.id)
+            return
+        status_map = {
+            "status_created": "created",
+            "status_shipped": "shipped",
+            "status_received": "received",
+        }
+        new_status = status_map.get(data)
+        if new_status:
+            cursor.execute("UPDATE orders SET status=? WHERE id=?", (new_status, oid))
+            conn.commit()
+            bot.send_message(call.message.chat.id, "Статус обновлен")
+        user_states.pop(call.message.chat.id, None)
+        bot.answer_callback_query(call.id)
+    elif data == "enter_track" and is_admin(call.from_user.id):
+        st = user_states.get(call.message.chat.id, {})
+        oid = st.get("order_id")
+        if not oid:
+            bot.answer_callback_query(call.id)
+            return
+        st["step"] = "track_input"
+        bot.send_message(call.message.chat.id, "Введите трек-номер")
+        bot.answer_callback_query(call.id)
     else:
         bot.answer_callback_query(call.id)
 
@@ -1432,6 +1520,18 @@ def receive_address(message):
     bot.send_message(admin_id, f"Пользователь {tag} ({message.from_user.id}) указал адрес по заказу #{order_id}:\n{address}")
 
 
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "track_input")
+def admin_track_number(message):
+    st = user_states.pop(message.chat.id, None)
+    oid = st.get("order_id") if st else None
+    if not oid:
+        return
+    track = message.text.strip()
+    cursor.execute("UPDATE orders SET tracking_number=? WHERE id=?", (track, oid))
+    conn.commit()
+    bot.send_message(message.chat.id, "Трек-номер сохранен")
+
+
 @bot.message_handler(commands=["confirm"], func=lambda m: is_admin(m.from_user.id))
 def admin_confirm(message):
     """Mark an order as confirmed once payment is verified."""
@@ -1448,7 +1548,7 @@ def admin_confirm(message):
     if not row:
         bot.reply_to(message, "Заказ не найден или не ваш")
         return
-    cursor.execute("UPDATE orders SET status='confirmed' WHERE id=?", (order_id,))
+    cursor.execute("UPDATE orders SET status='created' WHERE id=?", (order_id,))
     conn.commit()
     logging.info("Admin %s confirmed order %s", message.from_user.id, order_id)
     bot.reply_to(message, "Заказ подтвержден")
