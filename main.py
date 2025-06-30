@@ -20,6 +20,7 @@ TOKEN = "8148136479:AAG-Hz9XWqDN-H5hYMENE_NdfUSly1Rg35w"
 
 bot = telebot.TeleBot(TOKEN)
 BOT_USERNAME = bot.get_me().username
+REFERRAL_DISCOUNT = 5  # percent per invited user
 
 # Admin IDs
 # Replace or extend this list with the Telegram IDs of people who
@@ -637,7 +638,7 @@ def handle_referrals(message):
         "SELECT COUNT(*) FROM users WHERE referrer_id=?",
         (message.from_user.id,),
     ).fetchone()[0]
-    discount = count * 5
+    discount = count * REFERRAL_DISCOUNT
     link = f"https://t.me/{BOT_USERNAME}?start={code}"
     text = (
         f"Ваша реферальная ссылка:\n{link}\n"
@@ -784,7 +785,7 @@ def admin_referrals(message):
             "SELECT COUNT(*) FROM users WHERE referrer_id=?",
             (uid,),
         ).fetchone()[0]
-        discount = count * 5
+        discount = count * REFERRAL_DISCOUNT
         tag = f"@{username}" if username else str(uid)
         lines.append(f"{tag} | {link} | {count} реф. | скидка {discount}%")
     bot.send_message(message.chat.id, "\n".join(lines) if lines else "Нет пользователей")
@@ -1162,7 +1163,7 @@ def handle_callbacks(call):
         if count == 0:
             bot.answer_callback_query(call.id, "У вас нет рефералов")
             return
-        discount = count * 5
+        discount = count * REFERRAL_DISCOUNT
         while True:
             code = f"REF{random.randint(100000,999999)}"
             exists = cursor.execute(
