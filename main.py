@@ -1144,7 +1144,6 @@ def handle_callbacks(call):
             update_cart_item(call.from_user.id, prod_id, "", qty)
             bot.answer_callback_query(call.id, "Добавлено в корзину")
             bot.delete_message(call.message.chat.id, call.message.message_id)
-            show_cart(call.message.chat.id, call.from_user.id)
     elif data.startswith("addsz_"):
         _, pid, size = data.split("_", 2)
         pid = int(pid)
@@ -1156,7 +1155,6 @@ def handle_callbacks(call):
         update_cart_item(call.from_user.id, pid, size, qty)
         bot.answer_callback_query(call.id, "Добавлено в корзину")
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        show_cart(call.message.chat.id, call.from_user.id)
     elif data.startswith("inc_"):
         parts = data.split("_")
         prod_id = int(parts[1])
